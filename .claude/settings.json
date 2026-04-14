@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__pmcp__ask",
+      "mcp__pmcp__notify",
+      "mcp__pmcp__respond",
+      "mcp__pmcp__inject"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:8799/check-inject",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

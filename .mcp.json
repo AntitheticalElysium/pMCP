@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "pmcp": {
+      "command": "bun",
+      "args": ["server.ts"]
+    }
+  }
+}
