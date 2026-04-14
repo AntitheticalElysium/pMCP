@@ -1,0 +1,19 @@
+{
+  "name": "pmcp-benchmark",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "harness": "bun harness.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.2.105",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^4.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  }
+}

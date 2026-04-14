@@ -5,3 +5,10 @@ dist/
 *.log
 .env
 .env.*
+
+# Benchmark artifacts
+benchmark/logs/
+benchmark/patches/
+benchmark/runs.jsonl
+benchmark/grader_input.json
+benchmark/grading_results/
