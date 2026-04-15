@@ -194,7 +194,10 @@ export function createArmConfig(
       return {
         arm,
         prompt: BASE_PROMPT(task),
-        options: baseOptions,
+        options: {
+          ...baseOptions,
+          disallowedTools: ["Agent"],
+        },
       };
 
     case "B":

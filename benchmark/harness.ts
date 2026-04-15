@@ -16,7 +16,7 @@ function parseArgs() {
     tasks: 3,
     runs: 1,
     arms: ["A", "B", "C"] as Arm[],
-    model: "claude-sonnet-4-5-20250514",
+    model: "claude-sonnet-4-6",
     seed: 42,
     taskIds: null as string[] | null,
   };
@@ -47,8 +47,11 @@ type RunLog = {
   parent_tokens_out: number;
   subagent_tokens_in: number;
   subagent_tokens_out: number;
+  total_input: number;
+  total_output: number;
   total_cost_usd: number;
   wall_clock_ms: number;
+  num_turns: number;
   status: string;
   failure_reason: string | null;
   patch_path: string | null;
@@ -134,8 +137,11 @@ async function main() {
           parent_tokens_out: result.tokens.parent_output,
           subagent_tokens_in: result.tokens.subagent_input,
           subagent_tokens_out: result.tokens.subagent_output,
+          total_input: result.tokens.total_input,
+          total_output: result.tokens.total_output,
           total_cost_usd: result.tokens.total_cost_usd,
           wall_clock_ms: result.tokens.wall_clock_ms,
+          num_turns: result.tokens.num_turns,
           status: result.status,
           failure_reason: result.error ?? null,
           patch_path: patchPath,
@@ -143,7 +149,7 @@ async function main() {
 
         appendRun(log);
 
-        console.error(`  Status: ${result.status} | Cost: $${result.tokens.total_cost_usd.toFixed(4)} | Time: ${(result.tokens.wall_clock_ms / 1000).toFixed(1)}s | Patch: ${patch.trim() ? "yes" : "no"}`);
+        console.error(`  Status: ${result.status} | Cost: $${result.tokens.total_cost_usd.toFixed(4)} | Turns: ${result.tokens.num_turns} | Tokens: ${result.tokens.total_input}in/${result.tokens.total_output}out | Time: ${(result.tokens.wall_clock_ms / 1000).toFixed(1)}s | Patch: ${patch.trim() ? "yes" : "no"}`);
       }
     }
   }

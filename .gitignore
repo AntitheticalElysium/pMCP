@@ -7,8 +7,9 @@ dist/
 .env.*
 
 # Benchmark artifacts
+.swebench-work/
 benchmark/logs/
 benchmark/patches/
 benchmark/runs.jsonl
-benchmark/grader_input.json
+benchmark/grader_input*.json
 benchmark/grading_results/
