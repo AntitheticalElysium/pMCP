@@ -46,31 +46,28 @@ type GraderEntry = {
 };
 
 /**
- * Build the grader JSON from all saved patches.
- * Uses the best run per (arm, task) — the first non-empty patch.
+ * Build the grader JSON for a single run index.
+ * Each run is graded independently so we get per-run resolved rates.
  */
 export function buildGraderInput(
   arm: Arm,
   tasks: { instance_id: string }[],
-  runsPerTask: number,
+  runIdx: number,
 ): GraderEntry[] {
   const entries: GraderEntry[] = [];
 
   for (const task of tasks) {
-    let bestPatch = "";
-    for (let r = 0; r < runsPerTask; r++) {
-      const path = resolve(PATCHES_DIR, arm, task.instance_id, `${r}.diff`);
-      if (existsSync(path)) {
-        const patch = readFileSync(path, "utf-8");
-        if (patch.trim()) {
-          bestPatch = patch;
-          break;
-        }
+    let patch = "";
+    const path = resolve(PATCHES_DIR, arm, task.instance_id, `${runIdx}.diff`);
+    if (existsSync(path)) {
+      const content = readFileSync(path, "utf-8");
+      if (content.trim()) {
+        patch = content;
       }
     }
     entries.push({
       instance_id: task.instance_id,
-      patch: bestPatch,
+      patch,
       prefix: `pmcp_${arm}`,
     });
   }
@@ -78,14 +75,23 @@ export function buildGraderInput(
   return entries;
 }
 
-/** Write grader JSON file for a specific arm. */
+/**
+ * Write grader JSON files for a specific arm — one file per run index.
+ * Returns the list of paths written.
+ */
 export function writeGraderJson(
   arm: Arm,
   tasks: { instance_id: string }[],
   runsPerTask: number,
-): string {
-  const entries = buildGraderInput(arm, tasks, runsPerTask);
-  const outPath = resolve(import.meta.dirname, `grader_input_${arm}.json`);
-  writeFileSync(outPath, JSON.stringify(entries, null, 2));
-  return outPath;
+): string[] {
+  const paths: string[] = [];
+
+  for (let r = 0; r < runsPerTask; r++) {
+    const entries = buildGraderInput(arm, tasks, r);
+    const outPath = resolve(import.meta.dirname, `grader_input_${arm}_run${r}.json`);
+    writeFileSync(outPath, JSON.stringify(entries, null, 2));
+    paths.push(outPath);
+  }
+
+  return paths;
 }

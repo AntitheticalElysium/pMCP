@@ -1,10 +1,13 @@
-import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { loadSample, loadByIds } from "./tasks.js";
 import { prepareWorkdir, resetWorkdir } from "./docker.js";
 import { createArmConfig, type Arm } from "./arms.js";
 import { executeRun } from "./runner.js";
+import type { RunResult } from "./runner.js";
 import { capturePatch, savePatch, writeGraderJson } from "./patches.js";
+
+const MAX_RETRIES = 2;
 
 // ---------------------------------------------------------------------------
 // CLI args
@@ -29,6 +32,15 @@ function parseArgs() {
     else if (arg === "--model" && args[i + 1]) opts.model = args[++i];
     else if (arg === "--seed" && args[i + 1]) opts.seed = parseInt(args[++i]);
     else if (arg === "--task-ids" && args[i + 1]) opts.taskIds = args[++i].split(",");
+    else if (arg === "--task-file" && args[i + 1]) {
+      const content = readFileSync(args[++i], "utf-8");
+      opts.taskIds = content.split("\n").map(l => l.trim()).filter(l => l && !l.startsWith("#"));
+    }
+    else if (arg === "--fresh") opts.taskIds = opts.taskIds; // handled below
+  }
+  // --fresh flag: clear runs.jsonl before starting
+  if (args.includes("--fresh")) {
+    writeFileSync(resolve(import.meta.dirname, "runs.jsonl"), "");
   }
 
   return opts;
@@ -49,12 +61,18 @@ type RunLog = {
   subagent_tokens_out: number;
   total_input: number;
   total_output: number;
+  cache_read_input: number;
+  cache_creation_input: number;
   total_cost_usd: number;
   wall_clock_ms: number;
   num_turns: number;
   status: string;
+  retries: number;
   failure_reason: string | null;
   patch_path: string | null;
+  model_usage: Record<string, any>;
+  pmcp_asks: number;
+  pmcp_notifies: number;
 };
 
 const RUNS_PATH = resolve(import.meta.dirname, "runs.jsonl");
@@ -97,8 +115,8 @@ async function main() {
     console.error(`  ✓ ${task.instance_id}`);
   }
 
-  // Initialize runs.jsonl
-  writeFileSync(RUNS_PATH, "");
+  // Ensure runs.jsonl exists (append mode — never overwrite previous results)
+  if (!existsSync(RUNS_PATH)) writeFileSync(RUNS_PATH, "");
 
   // Run loop: task × arm × run
   let completed = 0;
@@ -112,20 +130,50 @@ async function main() {
         completed++;
         console.error(`\n[harness] [${completed}/${total}] ${task.instance_id} | Arm ${arm} | Run ${runIdx}`);
 
-        // Reset workdir to base commit
-        resetWorkdir(workdir, task.base_commit);
+        let result: RunResult | undefined;
+        let patch = "";
+        let patchPath: string | null = null;
+        let attempt = 0;
 
-        // Build arm config
-        const config = createArmConfig(arm, task, workdir, opts.model);
+        while (attempt <= MAX_RETRIES) {
+          if (attempt > 0) {
+            console.error(`  [retry ${attempt}/${MAX_RETRIES}] Re-attempting after 0-turn failure...`);
+          }
 
-        // Execute
-        const result = await executeRun(config);
+          // Reset workdir to base commit
+          resetWorkdir(workdir, task.base_commit);
+
+          // Build arm config (fresh per attempt — pMCP state must reset)
+          const config = createArmConfig(arm, task, workdir, opts.model);
+
+          // Execute
+          result = await executeRun(config);
+
+          // If we got real work done (>0 turns), accept the result
+          if (result.tokens.num_turns > 0 || result.status === "error") break;
+
+          attempt++;
+        }
+
+        if (!result) break; // should never happen
 
         // Capture patch
-        const patch = capturePatch(workdir, task.base_commit);
-        const patchPath = patch.trim()
+        patch = capturePatch(workdir, task.base_commit);
+        patchPath = patch.trim()
           ? savePatch(arm, task.instance_id, runIdx, patch)
           : null;
+
+        // Save transcript
+        const logDir = resolve(import.meta.dirname, "logs", arm, task.instance_id);
+        mkdirSync(logDir, { recursive: true });
+        const transcriptPath = resolve(logDir, `${runIdx}.jsonl`);
+        writeFileSync(
+          transcriptPath,
+          result.transcript.map((e) => JSON.stringify(e)).join("\n") + "\n",
+        );
+
+        // pMCP stats
+        const pmcpStats = result.pmcpStats;
 
         // Log
         const log: RunLog = {
@@ -139,38 +187,64 @@ async function main() {
           subagent_tokens_out: result.tokens.subagent_output,
           total_input: result.tokens.total_input,
           total_output: result.tokens.total_output,
+          cache_read_input: result.tokens.cache_read_input,
+          cache_creation_input: result.tokens.cache_creation_input,
           total_cost_usd: result.tokens.total_cost_usd,
           wall_clock_ms: result.tokens.wall_clock_ms,
           num_turns: result.tokens.num_turns,
           status: result.status,
+          retries: attempt,
           failure_reason: result.error ?? null,
           patch_path: patchPath,
+          model_usage: result.tokens.model_usage,
+          pmcp_asks: pmcpStats?.asks ?? 0,
+          pmcp_notifies: pmcpStats?.notifies ?? 0,
         };
 
         appendRun(log);
 
-        console.error(`  Status: ${result.status} | Cost: $${result.tokens.total_cost_usd.toFixed(4)} | Turns: ${result.tokens.num_turns} | Tokens: ${result.tokens.total_input}in/${result.tokens.total_output}out | Time: ${(result.tokens.wall_clock_ms / 1000).toFixed(1)}s | Patch: ${patch.trim() ? "yes" : "no"}`);
+        // Save pMCP detail log if any usage
+        if (pmcpStats && (pmcpStats.asks > 0 || pmcpStats.notifies > 0)) {
+          const pmcpLogPath = resolve(logDir, `${runIdx}.pmcp.json`);
+          writeFileSync(pmcpLogPath, JSON.stringify(pmcpStats, null, 2));
+        }
+
+        console.error(`  Status: ${result.status} | Cost: $${result.tokens.total_cost_usd.toFixed(4)} | Turns: ${result.tokens.num_turns} | Tokens: ${result.tokens.total_input}in/${result.tokens.total_output}out (cache_read: ${result.tokens.cache_read_input}, cache_create: ${result.tokens.cache_creation_input}) | Time: ${(result.tokens.wall_clock_ms / 1000).toFixed(1)}s | Patch: ${patch.trim() ? "yes" : "no"}`);
+        for (const [model, mu] of Object.entries(result.tokens.model_usage)) {
+          console.error(`    Model ${model}: in=${mu.inputTokens} out=${mu.outputTokens} cache_read=${mu.cacheReadInputTokens} cache_create=${mu.cacheCreationInputTokens} cost=$${mu.costUSD.toFixed(4)}`);
+        }
+        if (pmcpStats) {
+          console.error(`    pMCP: ${pmcpStats.asks} asks, ${pmcpStats.notifies} notifies, ${pmcpStats.injects} injects`);
+        }
       }
     }
   }
 
-  // Write grader JSONs
+  // Write grader JSONs — one file per (arm, run)
   console.error("\n[harness] Writing grader input files...");
+  const graderFiles: string[] = [];
   for (const arm of opts.arms) {
-    const path = writeGraderJson(arm, tasks, opts.runs);
-    console.error(`  ${arm}: ${path}`);
+    const paths = writeGraderJson(arm, tasks, opts.runs);
+    for (const p of paths) {
+      console.error(`  ${arm}: ${p}`);
+      graderFiles.push(p);
+    }
   }
 
-  console.error("\n[harness] Done. Run the grader:");
-  console.error(`  cd ../SWE-bench_Pro-os`);
-  console.error(`  python swe_bench_pro_eval.py \\`);
-  console.error(`    --raw_sample_path=helper_code/sweap_eval_full_v2.jsonl \\`);
-  console.error(`    --patch_path=../pMCP/benchmark/grader_input_A.json \\`);
-  console.error(`    --output_dir=../pMCP/benchmark/grading_results \\`);
-  console.error(`    --scripts_dir=run_scripts \\`);
-  console.error(`    --num_workers=1 \\`);
-  console.error(`    --dockerhub_username=jefzda \\`);
-  console.error(`    --use_local_docker`);
+  console.error("\n[harness] Done. Run the grader for each file:");
+  for (const gf of graderFiles) {
+    const basename = gf.split("/").pop()!;
+    const resultsDir = basename.replace(".json", "").replace("grader_input_", "grading_results_");
+    console.error(`\n  cd ../SWE-bench_Pro-os`);
+    console.error(`  python swe_bench_pro_eval.py \\`);
+    console.error(`    --raw_sample_path=helper_code/sweap_eval_full_v2.jsonl \\`);
+    console.error(`    --patch_path=../pMCP/benchmark/${basename} \\`);
+    console.error(`    --output_dir=../pMCP/benchmark/${resultsDir} \\`);
+    console.error(`    --scripts_dir=run_scripts \\`);
+    console.error(`    --num_workers=1 \\`);
+    console.error(`    --dockerhub_username=jefzda \\`);
+    console.error(`    --use_local_docker`);
+  }
 }
 
 main().catch((err) => {
