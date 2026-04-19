@@ -9,6 +9,19 @@ import { capturePatch, savePatch, writeGraderJson } from "./patches.js";
 
 const MAX_RETRIES = 2;
 
+const USAGE_LIMIT_PATTERNS = [
+  "out of extra usage",
+  "credit balance is too low",
+  "rate limit",
+  "usage limit",
+];
+
+function isUsageLimitError(error: string | undefined): boolean {
+  if (!error) return false;
+  const lower = error.toLowerCase();
+  return USAGE_LIMIT_PATTERNS.some(p => lower.includes(p));
+}
+
 // ---------------------------------------------------------------------------
 // CLI args
 // ---------------------------------------------------------------------------
@@ -22,6 +35,7 @@ function parseArgs() {
     model: "claude-sonnet-4-6",
     seed: 42,
     taskIds: null as string[] | null,
+    resume: false,
   };
 
   for (let i = 0; i < args.length; i++) {
@@ -36,6 +50,7 @@ function parseArgs() {
       const content = readFileSync(args[++i], "utf-8");
       opts.taskIds = content.split("\n").map(l => l.trim()).filter(l => l && !l.startsWith("#"));
     }
+    else if (arg === "--resume") opts.resume = true;
     else if (arg === "--fresh") opts.taskIds = opts.taskIds; // handled below
   }
   // --fresh flag: clear runs.jsonl before starting
@@ -118,6 +133,23 @@ async function main() {
   // Ensure runs.jsonl exists (append mode — never overwrite previous results)
   if (!existsSync(RUNS_PATH)) writeFileSync(RUNS_PATH, "");
 
+  // Load completed runs for --resume
+  const completedRuns = new Set<string>();
+  if (opts.resume) {
+    const lines = readFileSync(RUNS_PATH, "utf-8").split("\n").filter(Boolean);
+    for (const line of lines) {
+      try {
+        const entry = JSON.parse(line);
+        // Skip usage-limited entries — they need to be retried
+        if (isUsageLimitError(entry.failure_reason)) continue;
+        completedRuns.add(`${entry.task_id}|${entry.arm}|${entry.run_idx}`);
+      } catch {}
+    }
+    if (completedRuns.size > 0) {
+      console.error(`[harness] Resuming — ${completedRuns.size} runs already completed, skipping those`);
+    }
+  }
+
   // Run loop: task × arm × run
   let completed = 0;
   const total = tasks.length * opts.arms.length * opts.runs;
@@ -128,6 +160,11 @@ async function main() {
     for (const arm of opts.arms) {
       for (let runIdx = 0; runIdx < opts.runs; runIdx++) {
         completed++;
+        const runKey = `${task.instance_id}|${arm}|${runIdx}`;
+        if (completedRuns.has(runKey)) {
+          console.error(`\n[harness] [${completed}/${total}] ${task.instance_id} | Arm ${arm} | Run ${runIdx} — SKIPPED (already completed)`);
+          continue;
+        }
         console.error(`\n[harness] [${completed}/${total}] ${task.instance_id} | Arm ${arm} | Run ${runIdx}`);
 
         let result: RunResult | undefined;
@@ -149,6 +186,9 @@ async function main() {
           // Execute
           result = await executeRun(config);
 
+          // Usage limit — stop the entire harness immediately
+          if (isUsageLimitError(result.error)) break;
+
           // If we got real work done (>0 turns), accept the result
           if (result.tokens.num_turns > 0 || result.status === "error") break;
 
@@ -156,6 +196,18 @@ async function main() {
         }
 
         if (!result) break; // should never happen
+
+        // Usage limit — don't log, stop harness
+        if (isUsageLimitError(result.error)) {
+          console.error(`\n[harness] *** USAGE LIMIT HIT: ${result.error} ***`);
+          console.error(`[harness] Stopping. Re-run with --resume to continue when usage resets.`);
+          // Write grader JSONs for whatever we completed so far
+          console.error("\n[harness] Writing grader input files for completed runs...");
+          for (const a of opts.arms) {
+            writeGraderJson(a, tasks, opts.runs);
+          }
+          process.exit(2);
+        }
 
         // Capture patch
         patch = capturePatch(workdir, task.base_commit);
