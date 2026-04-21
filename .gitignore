@@ -12,4 +12,5 @@ benchmark/logs/
 benchmark/patches/
 benchmark/runs.jsonl
 benchmark/grader_input*.json
-benchmark/grading_results/
+benchmark/grading_results*/
+benchmark/*.log
