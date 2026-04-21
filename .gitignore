@@ -8,14 +8,15 @@ dist/
 
 # Benchmark artifacts
 .swebench-work/
-benchmark/logs/
-benchmark/patches/
-benchmark/runs.jsonl
+benchmark/logs/*
 benchmark/grader_input*.json
 benchmark/grading_results*/
 benchmark/*.log
 
 # Allow benchmark results and session logs across all runs
+!benchmark/logs/**/
 !benchmark/logs/**/0.jsonl
+!benchmark/logs/**/*.pmcp.json
+!benchmark/grading_results*/**/
 !benchmark/grading_results*/**/pmcp_*_output.json
 !benchmark/grading_results*/**/pmcp_*_patch.diff

