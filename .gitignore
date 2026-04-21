@@ -14,3 +14,8 @@ benchmark/runs.jsonl
 benchmark/grader_input*.json
 benchmark/grading_results*/
 benchmark/*.log
+
+# Allow benchmark results and session logs across all runs
+!benchmark/logs/**/0.jsonl
+!benchmark/grading_results*/**/pmcp_*_output.json
+!benchmark/grading_results*/**/pmcp_*_patch.diff
