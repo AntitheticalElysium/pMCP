@@ -33,7 +33,7 @@ Do not modify test files.`;
 
 const DELEGATION_SUFFIX = `\nDelegate implementation work to the worker subagent. You coordinate and verify.`;
 
-const DELEGATION_SUFFIX_PMCP = `\nDelegate implementation work to the worker subagent. You coordinate and verify. The worker will communicate with you via ask/notify — respond to asks promptly. When the worker notifies you of findings or approach, your response will be relayed back to the worker, so use it to course-correct, confirm the approach, or provide additional context. Keep your final summary concise (under 200 words).`;
+const DELEGATION_SUFFIX_PMCP = `\n\nYou are responsible for coordinating the task and ensuring the quality of the fix. You have full access to the environment tools (Bash, Read, Write), but you should delegate implementation, exploration, and test execution to the worker subagent to preserve your context window. Monitor the worker's progress via their notifications. If the worker asks for help or is stuck, use your tools to provide the necessary information or verification. Do not accept a task as complete until the worker has provided explicit evidence (e.g., test logs, code snippets) confirming the fix. Reject any summary that lacks proof.`;
 
 // ---------------------------------------------------------------------------
 // Worker subagent definition
@@ -49,13 +49,13 @@ const WORKER_PMCP_SUFFIX = `
 
 You have two communication tools — \`ask\` and \`notify\` — for talking with the parent agent. You MUST use them as part of your workflow:
 
-1. **After initial exploration**, notify the parent with what you found: which files are relevant, where the bug or issue is, and what approach you plan to take. Example: notify("The issue is in src/controllers/users.js:142 — the filter predicate doesn't account for deleted users. I plan to add a status check before the comparison.")
+1. **Evidence-based reporting**: When you notify the parent or ask for help, do not just summarize. You MUST provide the raw evidence you are looking at (e.g., the specific error message, the bash output of a failing test, or the code snippet you are analyzing). The parent cannot see your terminal or the files you have read unless you share them.
 
-2. **Before committing to a non-obvious approach**, ask the parent to confirm. This is critical when you find multiple candidate fixes, conflicting patterns in the codebase, or when the fix might have side effects. Example: ask("I found two places this could be fixed — in the query builder (cleaner) or in the controller (safer). The query builder approach changes shared code that 3 other endpoints use. Which do you prefer?")
+2. **Initial Exploration**: After finding the root cause, notify the parent with the raw evidence and your proposed plan.
 
-3. **When you discover something unexpected**, notify immediately. Example: notify("The failing test expects behavior X, but the issue description implies Y. There may be a contradiction — proceeding with what the test expects.")
+3. **Confirming Approach**: Ask the parent to confirm non-obvious approaches, especially when the fix might have side effects or when you find conflicting patterns in the codebase.
 
-These tools let you leverage the parent's broader context about the task and repository. The parent can see things you can't — use that. Do NOT skip communication and work in isolation.`;
+4. **Unexpected Discoveries**: Notify immediately if you find contradictions between the issue description and the actual code or test behavior.`;
 
 const workerAgent: AgentDefinition = {
   description: "General-purpose subagent for code exploration, implementation, and testing",
@@ -66,7 +66,6 @@ const workerAgent: AgentDefinition = {
 const workerAgentWithPmcp: AgentDefinition = {
   ...workerAgent,
   prompt: WORKER_PROMPT + WORKER_PMCP_SUFFIX,
-  // pMCP tools will be added via the MCP server
 };
 
 // ---------------------------------------------------------------------------
@@ -89,19 +88,30 @@ export type PmcpStats = {
   ask_responses: string[];
   notify_messages: string[];
   inject_responses: string[];
+  context_history: { agent_id: string | null; chars: number; timestamp_ms: number }[];
 };
 
 function createPmcpState(): PmcpState & { stats: PmcpStats } {
   const queryRef: { current: any } = { current: null };
   const inboxes = new Map<string, string[]>();
-  const stats: PmcpStats = { asks: 0, notifies: 0, injects: 0, ask_questions: [], ask_responses: [], notify_messages: [], inject_responses: [] };
+  const stats: PmcpStats = { 
+    asks: 0, 
+    notifies: 0, 
+    injects: 0, 
+    ask_questions: [], 
+    ask_responses: [], 
+    notify_messages: [], 
+    inject_responses: [],
+    context_history: []
+  };
   // Track the most recent worker agent_id for inject-on-notify
   let activeAgentId: string | null = null;
+  const startTime = Date.now();
 
   const askTool = tool(
     "ask",
-    "Ask the parent agent a blocking question. Use when you need clarification or information from the parent's context.",
-    { question: z.string().describe("The question to ask the parent agent") },
+    "Ask the parent agent a blocking question. Use when you need clarification, confirmation, or information from the parent's context. Always include the raw code or error logs you are asking about.",
+    { question: z.string().describe("The question to ask the parent agent, including relevant raw evidence.") },
     async ({ question }) => {
       stats.asks++;
       stats.ask_questions.push(question);
@@ -123,11 +133,11 @@ function createPmcpState(): PmcpState & { stats: PmcpStats } {
 
   const notifyTool = tool(
     "notify",
-    "Send a non-blocking notification to the parent agent. Use for progress updates or unexpected discoveries.",
+    "Send a non-blocking notification to the parent agent. Use for progress updates, plan confirmation, or unexpected discoveries. Include raw evidence.",
     {
       message: z
         .string()
-        .describe("The notification message to send to the parent"),
+        .describe("The notification message, including relevant raw evidence."),
     },
     async ({ message }) => {
       stats.notifies++;
@@ -136,10 +146,6 @@ function createPmcpState(): PmcpState & { stats: PmcpStats } {
       if (!q) {
         return { content: [{ type: "text" as const, text: "Notified." }] };
       }
-      // Fire-and-forget from worker's perspective: notify returns immediately.
-      // Parent sees the notification via askSideQuestion. If the parent responds
-      // (e.g. course correction), that response is injected into the worker's
-      // inbox and delivered on its next tool call via the PreToolUse hook.
       q.askSideQuestion(`[NOTIFICATION FROM SUBAGENT]: ${message}`)
         .then((result: any) => {
           const response = result?.response;
@@ -160,7 +166,7 @@ function createPmcpState(): PmcpState & { stats: PmcpStats } {
     tools: [askTool, notifyTool],
   });
 
-  // Hooks for inject delivery
+  // Hooks for inject delivery and context tracking
   const subagentStartHook: HookCallbackMatcher = {
     hooks: [
       async (input) => {
@@ -177,7 +183,22 @@ function createPmcpState(): PmcpState & { stats: PmcpStats } {
   const preToolUseHook: HookCallbackMatcher = {
     hooks: [
       async (input) => {
-        const { agent_id } = input as PreToolUseHookInput;
+        const { agent_id, transcript_path } = input as PreToolUseHookInput & { transcript_path?: string };
+        
+        // Track context size
+        if (transcript_path && typeof transcript_path === "string") {
+            try {
+                const content = await import("node:fs/promises").then(fs => fs.readFile(transcript_path, "utf-8"));
+                stats.context_history.push({
+                    agent_id: agent_id ?? null,
+                    chars: content.length,
+                    timestamp_ms: Date.now() - startTime
+                });
+            } catch (e) {
+                console.error(`[pmcp] Failed to read transcript for context tracking: ${e}`);
+            }
+        }
+
         if (!agent_id || !inboxes.has(agent_id)) return { continue: true };
         const inbox = inboxes.get(agent_id)!;
         if (inbox.length === 0) return { continue: true };
