@@ -1,0 +1,7 @@
+[
+  {
+    "instance_id": "instance_NodeBB__NodeBB-bd80d36e0dcf78cd4360791a82966078b3a07712-v4fbcfae8b15e4ce5d132c408bca69ebb9cf146ed",
+    "patch": "diff --git a/src/middleware/user.js b/src/middleware/user.js\nindex 57c1db8296..108ce87b43 100644\n--- a/src/middleware/user.js\n+++ b/src/middleware/user.js\n@@ -240,13 +240,13 @@ module.exports = function (middleware) {\n \t\tconst path = req.path.startsWith('/api/') ? req.path.replace('/api', '') : req.path;\n \n \t\tif (!req.session.hasOwnProperty('registration')) {\n-\t\t\tif (req.uid && !path.endsWith('/edit/email')) {\n+\t\t\tif (req.uid && !path.endsWith('/edit/email') && !path.startsWith('/confirm/')) {\n \t\t\t\tconst [confirmed, isAdmin] = await Promise.all([\n \t\t\t\t\tuser.getUserField(req.uid, 'email:confirmed'),\n \t\t\t\t\tuser.isAdministrator(req.uid),\n \t\t\t\t]);\n \t\t\t\tif (meta.config.requireEmailAddress && !confirmed && !isAdmin) {\n-\t\t\t\t\tcontrollers.helpers.redirect(res, '/me/edit/email');\n+\t\t\t\t\treturn controllers.helpers.redirect(res, '/me/edit/email');\n \t\t\t\t}\n \t\t\t}\n \n",
+    "prefix": "pmcp_A"
+  }
+]

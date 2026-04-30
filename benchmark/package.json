@@ -9,6 +9,7 @@
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "0.2.105",
+    "@anthropic-ai/tokenizer": "^0.0.4",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "zod": "^4.3.0"
   },

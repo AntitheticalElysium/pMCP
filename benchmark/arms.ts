@@ -31,9 +31,12 @@ ${task.fail_to_pass.join("\n")}
 Fix the issue so that the failing tests pass without breaking existing tests.
 Do not modify test files.`;
 
-const DELEGATION_SUFFIX = `\nDelegate implementation work to the worker subagent. You coordinate and verify.`;
+const DELEGATION_SUFFIX = `\nDelegate implementation work to the worker subagent. You coordinate and verify. Once the worker finishes and you are satisfied with the result, summarize the fix and stop. Do not loop or generate unnecessary conversational messages.`;
 
-const DELEGATION_SUFFIX_PMCP = `\n\nYou are responsible for coordinating the task and ensuring the quality of the fix. You have full access to the environment tools (Bash, Read, Write), but you should delegate implementation, exploration, and test execution to the worker subagent to preserve your context window. Monitor the worker's progress via their notifications. If the worker asks for help or is stuck, use your tools to provide the necessary information or verification. Do not accept a task as complete until the worker has provided explicit evidence (e.g., test logs, code snippets) confirming the fix. Reject any summary that lacks proof.`;
+const DELEGATION_SUFFIX_PMCP = `\n\nYou are the architectural coordinator. Your workflow must follow these three phases:
+1. **Initial Triage**: Perform a brief, high-level investigation (e.g., using Bash to grep or Read entrypoints) to understand the repo structure and locate the bug's general neighborhood. Do NOT read massive files or run test suites yourself.
+2. **Delegation**: Once you have a starting point, IMMEDIATELY delegate the deep exploration, implementation, and test execution to the worker subagent. Pass them your high-level findings. This is critical to preserve your context window.
+3. **Unblocking (pMCP)**: The worker will use 'ask' and 'notify' to communicate with you. When the worker gets stuck or asks a question, YOU must use your tools (Bash, Read) to investigate and reply with exact solutions. Do not guess; verify before responding. Keep your final summary concise (under 200 words).`;
 
 // ---------------------------------------------------------------------------
 // Worker subagent definition
@@ -47,15 +50,15 @@ When you're done, summarize what you changed and why.`;
 
 const WORKER_PMCP_SUFFIX = `
 
-You have two communication tools — \`ask\` and \`notify\` — for talking with the parent agent. You MUST use them as part of your workflow:
+You have two communication tools — \`ask\` and \`notify\` — for talking with the parent agent using the pMCP protocol. You MUST use them as part of your workflow:
 
-1. **Evidence-based reporting**: When you notify the parent or ask for help, do not just summarize. You MUST provide the raw evidence you are looking at (e.g., the specific error message, the bash output of a failing test, or the code snippet you are analyzing). The parent cannot see your terminal or the files you have read unless you share them.
+1. **After initial exploration**, notify the parent with what you found: which files are relevant, where the bug or issue is, and what approach you plan to take. Example: notify("The issue is in src/controllers/users.js:142 — the filter predicate doesn't account for deleted users. I plan to add a status check before the comparison.")
 
-2. **Initial Exploration**: After finding the root cause, notify the parent with the raw evidence and your proposed plan.
+2. **Before committing to a non-obvious approach**, ask the parent to confirm. This is critical when you find multiple candidate fixes, conflicting patterns in the codebase, or when the fix might have side effects. Example: ask("I found two places this could be fixed — in the query builder (cleaner) or in the controller (safer). The query builder approach changes shared code that 3 other endpoints use. Which do you prefer?")
 
-3. **Confirming Approach**: Ask the parent to confirm non-obvious approaches, especially when the fix might have side effects or when you find conflicting patterns in the codebase.
+3. **When you get stuck, tests fail, or you can't find a file**, use \`ask\` to request the parent to investigate. Provide the exact error snippet. The parent has tools to search the environment and will find the answer for you. Example: ask("I ran pytest but got a TypeMismatch on line 42 in foo.py. Here is the traceback. I can't find where the type is defined, can you search for it?")
 
-4. **Unexpected Discoveries**: Notify immediately if you find contradictions between the issue description and the actual code or test behavior.`;
+These tools let you leverage the parent's broader context and search capabilities. Do NOT skip communication, give up, or work in isolation.`;
 
 const workerAgent: AgentDefinition = {
   description: "General-purpose subagent for code exploration, implementation, and testing",
@@ -94,13 +97,13 @@ export type PmcpStats = {
 function createPmcpState(): PmcpState & { stats: PmcpStats } {
   const queryRef: { current: any } = { current: null };
   const inboxes = new Map<string, string[]>();
-  const stats: PmcpStats = { 
-    asks: 0, 
-    notifies: 0, 
-    injects: 0, 
-    ask_questions: [], 
-    ask_responses: [], 
-    notify_messages: [], 
+  const stats: PmcpStats = {
+    asks: 0,
+    notifies: 0,
+    injects: 0,
+    ask_questions: [],
+    ask_responses: [],
+    notify_messages: [],
     inject_responses: [],
     context_history: []
   };
@@ -155,7 +158,7 @@ function createPmcpState(): PmcpState & { stats: PmcpStats } {
             stats.inject_responses.push(response);
           }
         })
-        .catch(() => {});
+        .catch(() => { });
       return { content: [{ type: "text" as const, text: "Notified." }] };
     },
   );
@@ -184,19 +187,19 @@ function createPmcpState(): PmcpState & { stats: PmcpStats } {
     hooks: [
       async (input) => {
         const { agent_id, transcript_path } = input as PreToolUseHookInput & { transcript_path?: string };
-        
+
         // Track context size
         if (transcript_path && typeof transcript_path === "string") {
-            try {
-                const content = await import("node:fs/promises").then(fs => fs.readFile(transcript_path, "utf-8"));
-                stats.context_history.push({
-                    agent_id: agent_id ?? null,
-                    chars: content.length,
-                    timestamp_ms: Date.now() - startTime
-                });
-            } catch (e) {
-                console.error(`[pmcp] Failed to read transcript for context tracking: ${e}`);
-            }
+          try {
+            const content = await import("node:fs/promises").then(fs => fs.readFile(transcript_path, "utf-8"));
+            stats.context_history.push({
+              agent_id: agent_id ?? null,
+              chars: content.length,
+              timestamp_ms: Date.now() - startTime
+            });
+          } catch (e) {
+            console.error(`[pmcp] Failed to read transcript for context tracking: ${e}`);
+          }
         }
 
         if (!agent_id || !inboxes.has(agent_id)) return { continue: true };

@@ -55,7 +55,9 @@ function buildTranscriptEntry(msg: SDKMessage, startTime: number): TranscriptEnt
     }
 
     console.error(
-      `    [sdk] assistant (${isSubagent ? "subagent" : "parent"}) in=${usage?.input_tokens ?? 0} out=${usage?.output_tokens ?? 0}`,
+      `    [sdk] assistant (${isSubagent ? "subagent" : "parent"}) in=${usage?.input_tokens ?? 0} out=${usage?.output_tokens ?? 0} ` + 
+      (toolName ? `[Tool: ${toolName}] ` : '') + 
+      (textPreview ? `"${textPreview.replace(/\n/g, ' ').slice(0, 50)}..."` : '')
     );
 
     return {

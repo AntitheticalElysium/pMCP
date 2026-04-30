@@ -6,6 +6,7 @@ import { createArmConfig, type Arm } from "./arms.js";
 import { executeRun } from "./runner.js";
 import type { RunResult } from "./runner.js";
 import { capturePatch, savePatch, writeGraderJson } from "./patches.js";
+import { countTokens } from "@anthropic-ai/tokenizer";
 
 const MAX_RETRIES = 2;
 
@@ -88,6 +89,8 @@ type RunLog = {
   model_usage: Record<string, any>;
   pmcp_asks: number;
   pmcp_notifies: number;
+  max_parent_context: number;
+  max_subagent_context: number;
 };
 
 const RUNS_PATH = resolve(import.meta.dirname, "runs.jsonl");
@@ -143,7 +146,7 @@ async function main() {
         // Skip usage-limited entries — they need to be retried
         if (isUsageLimitError(entry.failure_reason)) continue;
         completedRuns.add(`${entry.task_id}|${entry.arm}|${entry.run_idx}`);
-      } catch {}
+      } catch { }
     }
     if (completedRuns.size > 0) {
       console.error(`[harness] Resuming — ${completedRuns.size} runs already completed, skipping those`);
@@ -171,6 +174,7 @@ async function main() {
         let patch = "";
         let patchPath: string | null = null;
         let attempt = 0;
+        let contextSizes: { agent_id: string | null, tokens: number }[] = [];
 
         while (attempt <= MAX_RETRIES) {
           if (attempt > 0) {
@@ -182,6 +186,30 @@ async function main() {
 
           // Build arm config (fresh per attempt — pMCP state must reset)
           const config = createArmConfig(arm, task, workdir, opts.model);
+
+          // Add precise token tracking via hook
+          contextSizes = []; // Reset on retry
+          const tokenTrackingHook = {
+            hooks: [
+              async (input: any) => {
+                try {
+                  if (input.transcript_path) {
+                    const str = readFileSync(input.transcript_path, "utf-8");
+                    const numTokens = countTokens(str);
+                    contextSizes.push({
+                      agent_id: input.agent_id || null,
+                      tokens: numTokens
+                    });
+                  }
+                } catch (e) { }
+                return { continue: true };
+              }
+            ]
+          };
+
+          if (!config.options.hooks) config.options.hooks = {};
+          if (!config.options.hooks.PreToolUse) config.options.hooks.PreToolUse = [];
+          config.options.hooks.PreToolUse.push(tokenTrackingHook);
 
           // Execute
           result = await executeRun(config);
@@ -251,6 +279,8 @@ async function main() {
           model_usage: result.tokens.model_usage,
           pmcp_asks: pmcpStats?.asks ?? 0,
           pmcp_notifies: pmcpStats?.notifies ?? 0,
+          max_parent_context: contextSizes.filter((c: any) => !c.agent_id).reduce((max: number, c: any) => Math.max(max, c.tokens), 0),
+          max_subagent_context: contextSizes.filter((c: any) => c.agent_id).reduce((max: number, c: any) => Math.max(max, c.tokens), 0),
         };
 
         appendRun(log);
